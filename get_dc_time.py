@@ -4,10 +4,12 @@ import platform
 import re
 import subprocess
 import concurrent.futures
+import sys
+import os
 from datetime import datetime, timedelta, timezone
 
-# 全局超时设置：3s
-QUERY_TIMEOUT = 3
+# 全局默认超时设置：3s
+QUERY_TIMEOUT = 3.0
 
 
 def set_local_time(time_str: str):
@@ -55,7 +57,9 @@ def query_ldap(dc_ip):
         "currentTime",
     ]
     try:
-        output = subprocess.check_output(cmd, text=True, timeout=QUERY_TIMEOUT)
+        output = subprocess.check_output(
+            cmd, text=True, timeout=QUERY_TIMEOUT, stderr=subprocess.DEVNULL
+        )
     except subprocess.TimeoutExpired:
         return False, f"LDAP query timed out after {QUERY_TIMEOUT}s"
     except Exception as e:
@@ -98,7 +102,9 @@ def query_ntp(dc_ip):
 def query_http(dc_ip):
     cmd = ["htpdate", "-q", dc_ip]
     try:
-        output = subprocess.check_output(cmd, text=True, timeout=QUERY_TIMEOUT)
+        output = subprocess.check_output(
+            cmd, text=True, timeout=QUERY_TIMEOUT, stderr=subprocess.DEVNULL
+        )
         offset = None
         for line in output.splitlines():
             if "Offset" in line:
@@ -120,7 +126,9 @@ def query_http(dc_ip):
 def query_smb(dc_ip):
     cmd = ["net", "time", "system", "-S", dc_ip]
     try:
-        output = subprocess.check_output(cmd, text=True, timeout=QUERY_TIMEOUT).strip()
+        output = subprocess.check_output(
+            cmd, text=True, timeout=QUERY_TIMEOUT, stderr=subprocess.DEVNULL
+        ).strip()
         m = re.match(
             r"(?P<mo>\d{2})(?P<da>\d{2})(?P<h>\d{2})(?P<mi>\d{2})(?P<yr>\d{4})\.(?P<sec>\d+)",
             output,
@@ -150,6 +158,17 @@ def main():
         help="Query method (optional). If not provided, try all methods concurrently",
     )
     parser.add_argument(
+        "-all",
+        action="store_true",
+        help="Test all protocols concurrently and wait for all to finish (do not exit early on first success)",
+    )
+    parser.add_argument(
+        "-timeout",
+        type=float,
+        default=3.0,
+        help="Set the timeout for queries in seconds (default: 3.0)",
+    )
+    parser.add_argument(
         "-debug",
         action="store_true",
         help="Enable debug output showing each query attempt result",
@@ -163,6 +182,10 @@ def main():
     parser.add_argument("dc_ip", help="Domain Controller IP or hostname")
     args = parser.parse_args()
 
+    # 应用用户配置的超时时间
+    global QUERY_TIMEOUT
+    QUERY_TIMEOUT = args.timeout
+
     query_funcs = {
         "ldap": query_ldap,
         "smb": query_smb,
@@ -173,51 +196,54 @@ def main():
     time_str = None
 
     if args.type:
-        # 如果指定了类型，只运行单个查询
         success, result = query_funcs[args.type](args.dc_ip)
         if success:
             time_str = result
         else:
-            if args.debug:
+            if args.debug or args.all:
                 print(f"{args.type.upper()} query failed: {result}")
     else:
-        # 并发执行所有查询
         methods = ["ldap", "smb", "ntp", "http"]
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        future_to_method = {
+            executor.submit(query_funcs[m], args.dc_ip): m for m in methods
+        }
 
-        # 记录查询结果，方便在 debug 时输出
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-            # 提交所有任务
-            future_to_method = {
-                executor.submit(query_funcs[m], args.dc_ip): m for m in methods
-            }
+        for future in concurrent.futures.as_completed(future_to_method):
+            method = future_to_method[future]
+            try:
+                success, result = future.result()
 
-            # as_completed 会在任意一个线程完成时 yield，谁先成功就用谁的时间
-            for future in concurrent.futures.as_completed(future_to_method):
-                method = future_to_method[future]
-                try:
-                    success, result = future.result()
-                    if args.debug:
-                        print(
-                            f"Trying {method.upper()}: {'Success' if success else 'Fail'} - {result}"
-                        )
+                # 如果开启了 -debug 或者是 -all 测试模式，就打印每个线程的结果
+                if args.debug or args.all:
+                    print(
+                        f"Trying {method.upper()}: {'Success' if success else 'Fail'} - {result}"
+                    )
 
-                    # 拿到第一个成功的结果后记录下来
-                    if success and not time_str:
-                        time_str = result
-                        # 注意：ThreadPoolExecutor 不支持直接终止正在运行的线程。
-                        # 因为设置了 500ms 超时，其余线程会很快自然结束，所以直接记录结果即可。
-                except Exception as e:
-                    if args.debug:
-                        print(f"{method.upper()} query generated an exception: {e}")
+                if success and not time_str:
+                    time_str = result
 
-        if not time_str:
-            print("All query methods failed or timed out.")
+                    # 核心改动：如果没有 -all 参数，才提前跳出循环；否则继续等待其他线程完成
+                    if not args.all:
+                        break
+            except Exception as e:
+                if args.debug or args.all:
+                    print(f"{method.upper()} query generated an exception: {e}")
 
-    # 最终输出并设置时间
-    if time_str:
+    # 最终输出并设置时间，随后直接硬性终结整个进程
+    if not time_str:
+        print("All query methods failed or timed out.")
+        sys.stdout.flush()
+        os._exit(1)
+    else:
+        if args.debug or args.all:
+            print("\n[+] Final adopted time:")
         print(time_str)
         if args.set_time:
             set_local_time(time_str)
+
+        sys.stdout.flush()
+        os._exit(0)
 
 
 if __name__ == "__main__":
